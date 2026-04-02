@@ -1,0 +1,320 @@
+---
+title: "Manual Estimation of Seasonally Adjusted Unemployment Statistics"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+In this excercise, I attempt to construct a seasonally adjusted time series of unemployment spanning the 2010s that closely resembles the official BLS seasonal adjustment. I conduct some exploratory data analysis on the dataset to check for missing values. From the X-13ARIMA-SEATS methodology, I borrow the concept of extending the tails of the time series in order to obtain a robust decomposition of the time series.
+
+
+```{r, echo=FALSE}
+library(tidyverse)
+library(forecast)
+
+```
+
+```{r, echo=FALSE}
+df <- read_csv("cps_00020.csv", show_col_types = FALSE)
+```
+
+## Exploratory Data Analysis
+
+I create a date variable for analysis
+```{r}
+df_clean <- df %>%   mutate(date = as.Date(sprintf('%d/%02d/01', YEAR, MONTH)))
+```
+
+#### Classify inconsistencies in employment classification
+I compare variables pertaining to employment status in order to extract potential inconsistencies.
+```{r}
+df_flags <- df_clean %>%
+  mutate(
+    
+    # LF, E/U status
+    
+    EMPSTAT_employed = EMPSTAT %in% 10:12,
+    EMPSTAT_unemployed = EMPSTAT %in% 20:22,
+    EMPSTAT_nilf = EMPSTAT %in% 30:36,
+    
+    LAB_lf = LABFORCE == 2,
+    LAB_nilf = LABFORCE == 1,
+    
+    # Inconsistency flags for variables
+    
+    flag_lf_mismatch = case_when(
+      LAB_lf & EMPSTAT_nilf ~ 1,
+      LAB_nilf & (EMPSTAT_employed | EMPSTAT_unemployed) ~ 1,
+      TRUE ~ 0
+    ),
+    
+    flag_WHYUNEMP = case_when(
+      EMPSTAT_employed & WHYUNEMP != 0 ~ 1,
+      (EMPSTAT_employed | EMPSTAT_nilf) & WHYUNEMP != 0 ~ 1,
+      EMPSTAT_unemployed & WHYUNEMP == 0 ~ 1,
+      TRUE ~ 0
+    ),
+    
+    flag_DURUNEMP = case_when(
+      EMPSTAT_employed   & DURUNEMP != 999 ~ 1,
+      EMPSTAT_nilf & DURUNEMP != 999 ~ 1,
+      EMPSTAT_unemployed & DURUNEMP == 999 ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Main inconsistency flag
+    flag_any_inconsistency = if_any(starts_with("flag_"), ~ . == 1)
+    
+  )
+```
+
+#### Summarize inconsistent observations
+```{r}
+#Means
+df_flags %>% summarise(across(starts_with("flag_"), mean))
+#Counts
+df_flags %>% summarise(across(starts_with("flag_"), ~ sum(. == 1)))
+```
+
+#### Check inconsistencies within individuals
+```{r}
+df_flag_by_people <- df_flags %>%
+  group_by(CPSIDP) %>%
+  summarise(
+    times_flagged = sum(flag_DURUNEMP == 1),
+    n_obs = n(),
+    share_flagged = times_flagged / n_obs,
+    .groups = "drop"
+  )
+
+df_flag_by_people %>%
+  count(times_flagged)
+
+```
+
+
+#### Check time trends of inconsistencies
+```{r}
+df_flag_rates_time <- df_flags %>%
+  group_by(date) %>%
+  summarise(
+    across(
+      c(flag_lf_mismatch, flag_WHYUNEMP, flag_DURUNEMP, flag_any_inconsistency),
+      ~ mean(.)
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = -date,
+    names_to = "flag",
+    values_to = "rate"
+  )
+
+df_flag_rates_time %>%
+  ggplot(aes(x = date, y = rate, color = flag)) +
+  geom_line() +
+  labs(
+    x = "Date",
+    y = "Flag rate",
+    title = "Flag rates over time"
+  )
+```
+Flagged inconsistencies appear to be rare and are only driven by the variable DUREMP, which measures the duration of one's unemployment. If one is employed, one should not have a duration of employment. It appears that these issues are limited and are unlikely to affect estimates, however, for maximum robustness, they should be studied closer.
+
+#### Construct unemployment rate using survey weights
+```{r}
+df_unemp <- df_flags %>%
+  group_by(date) %>%
+  summarise(
+    E  = sum(WTFINL * EMPSTAT_employed),
+    U  = sum(WTFINL * EMPSTAT_unemployed),
+    LF_check = sum(WTFINL * LAB_lf), # sanity check for comparing the LF variable from IPUMS and the LF variable I construct from the EMPSTAT variable. Minimal difference
+    LF = E + U,
+    UNRATE = U / LF,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    lf_diff = LF_check - LF
+  )
+
+
+ggplot(df_unemp, aes(x = date, y = UNRATE)) +
+  geom_line() +
+  labs(
+    title = "Unemployment Rate",
+    x = "",
+    y = ""
+  )
+
+```
+
+## Seasonal Adjustment
+
+#### Log transform data
+```{r}
+
+df_unemp <- df_unemp %>% arrange(date) #sanity check for valid date order
+
+df_unemp <- df_unemp %>%
+  mutate(log_unemp = log(UNRATE))   # log transform to use additive model
+  
+ts_unemp <- ts(df_unemp$log_unemp,  # turn to timeseries object 
+               start = c(year(min(df_unemp$date)), month(min(df_unemp$date))),
+               frequency = 12
+               )
+```
+
+#### Fit Seasonal ARIMA model
+```{r}
+init_arima <- Arima(ts_unemp, order = c(0,1,1),
+             seasonal = c(0,1,1)
+             )
+
+summary(init_arima)
+auto.arima(ts_unemp)
+```
+auto.arima() fails to generate a model with lower AIC & BIC than the standard seasonal adjustment SARIMA(0,1,1)(0,1,1)_12. I move forward with the latter.
+
+#### Forecast and Backcast with ARIMA
+I will be extending the tails of my dataset by 13 months by predicting them with our model of best fit. Thus, moving average calculations will not limit my time sample.
+```{r}
+H = 13 # horizon for tails of extended forecast. will be 13 since I will use a 13 period MA
+
+## FORECAST
+
+forcast <- forecast(init_arima, h = H)$mean # misspelling forecast out of an abundance of caution for the function forecast()
+
+## BACKCAST
+
+# reverse time series in order to backcast
+ts_unemp_rev <- ts(rev(ts_unemp), frequency = 12)
+
+# fit past prediction
+init_arima_rev <- Arima(ts_unemp_rev, order = c(0,1,1),
+                        seasonal = c(0,1,1)
+                        )
+
+backcast <- rev(forecast(init_arima_rev, h = H)$mean)
+
+# COMBINE INTO EXTENDED TIME SERIES
+
+unemp_extended <- ts(c(backcast, ts_unemp, forcast),
+                     start = c(2008, 12), # the year and month here depends on H
+                     frequency = 12
+                     )
+
+plot(exp(ts_unemp))
+plot(exp(unemp_extended))
+```
+
+#### Construct a Moving Average & Remove Trend
+```{r}
+MA13 <- stats::filter(unemp_extended, rep(1/13, 13), sides = 2)
+plot(MA13)
+
+SI <- unemp_extended - MA13 # since ts_unemp is logged, I subtract the moving average from it to obtain the seasonal and irregular component
+plot(SI, main = "De-Trended Component")
+```
+I could estimate the seasonal component by averaging the value of every month, and then substracting the average of those averages from every month. However, this would impose a fixed and constantly repeating structure over the full sample, and would not be representative of shifting seasonalities. Instead, I estimate seasonality using a local smoother over related months, the prior month, the same month last year, and the same month next year, up to 2 years from the original month. This way, the seasonal component can vary gradually over time.
+
+#### Calculate Seasonal Component
+```{r}
+SI_core <- window(SI, start = start(ts_unemp), end = end(ts_unemp))
+
+S_temp <- length(SI_core)
+
+# smoothing
+for (i in seq_along(SI_core)) {
+  t <- c(i - 24, i - 12, i, i + 12, i + 24)
+  t <- t[t >= 1 & t <= length(SI_core)]
+  S_temp[i] <- mean(SI_core[t])
+}
+
+S <- ts(S_temp, start = start(SI_core), frequency = 12)
+plot(S, main = "Seasonal Component")
+```
+
+
+#### Calculate Irregular Component
+```{r}
+I <- SI - S
+plot(I, main = "Irregular Component")
+abline(h = 0, col = "red")
+```
+
+## Model Diagnostics
+```{r}
+mean(I)
+acf(I, main = "ACF of Irregular Component")
+hist(I, breaks = 30, main = "Histogram of Irregular")
+qqnorm(I); qqline(I)
+shapiro.test(I)
+
+```
+The mean of the irregular component is 0. However, by the Shapiro-Wilk test, there is sufficient evidence to infer that this component is not normal, and the normality of the irregular component is rejected. By examining the auto correllation function, histogram, and QQ plot of the irregular component, we can say that some seasonality and outliers are still affecting our model results. Using more advanced methods to identity outliers, and iterating our estimation of time series components can improve our model and turn the irregular component into true white noise.
+
+#### Seasonal Adjustment
+```{r}
+unemp_sa <- exp(unemp_extended - S)
+
+unemp_sa <- window(
+  unemp_sa,
+  start = start(ts_unemp),
+  end = end(ts_unemp)
+)
+
+plot(unemp_sa, main = "Manual Seasonal Adjustment of Unemployment")
+```
+
+#### Comparison to Actual Figure
+```{r}
+
+UNRATE_SA_BLS <- ts(read_csv("UNRATE.csv", show_col_types = FALSE)$UNRATE/100,
+                    start = c(2010, 1),
+                    frequency = 12
+                    )
+plot(UNRATE_SA_BLS, main = "BLS Actual Seasonal Adjustment")
+
+ts.plot(
+  UNRATE_SA_BLS,
+  unemp_sa,
+  exp(ts_unemp),
+  col = c("blue", "red", "gray"),
+  lty = 1,
+  main = "Seasonally Adjusted Unemployment: BLS vs Manual",
+  ylab = "Unemployment Rate"
+)
+
+legend(
+  "topright",
+  legend = c("BLS", "Manual", "Not SA"),
+  col = c("blue", "red", "gray"),
+  lty = 1
+)
+```
+```{r}
+# compute metrics
+diff <- UNRATE_SA_BLS - unemp_sa
+mean_diff <- mean(diff)
+sd_diff <- sd(diff)
+rmse <- sqrt(mean(diff^2))
+corr <- cor(UNRATE_SA_BLS, unemp_sa, use = "complete.obs")
+
+# create table
+results_table <- data.frame(
+  Metric = c("Mean Difference", "SD of Difference", "RMSE", "Correlation"),
+  Value  = c(mean_diff, sd_diff, rmse, corr)
+)
+
+results_table
+```
+It looks like this attempt resembles the BLS seasonal revision closely.
+
+## References
+https://www.census.gov/data/software/x13as.About_X-13.html#list-tab-635278563 <br>
+https://www.census.gov/topics/research/seasonal-adjustment.html <br>
+https://otexts.com/fpp3/components.html <br>
+https://sthalles.github.io/a-visual-guide-to-time-series-decomposition/ <br>
+https://www.bls.gov/cps/seasonal-adjustment-methodology.htm#x11 <br>
+Sarah Flood, Miriam King, Renae Rodgers, Steven Ruggles, J. Robert Warren, Daniel Backman, Etienne Breton, Grace Cooper, Julia A. Rivera Drew, Stephanie Richards, David Van Riper, and Kari C.W. Williams. IPUMS CPS: Version 13.0 [dataset]. Minneapolis, MN: IPUMS, 2025. https://doi.org/10.18128/D030.V13.0
+
